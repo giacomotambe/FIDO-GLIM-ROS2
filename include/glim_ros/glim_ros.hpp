@@ -142,6 +142,9 @@ private:
 
   std::shared_ptr<glim::WallFilter>               wall_filter;
   std::shared_ptr<glim::AsyncDynamicObjectRejection> dynamic_object_rejection;
+  // frame_id of the input clouds, for the static clouds published from the rejection thread
+  // (written once, before the first frame is queued for the rejection).
+  std::string rejection_frame_id_;
 
   std::shared_ptr<glim::WallBBoxRegistry> wall_bbox_registry_;
   std::shared_ptr<glim::DynamicClusterExtractor> cluster_extractor;

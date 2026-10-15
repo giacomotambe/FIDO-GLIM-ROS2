@@ -211,6 +211,16 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     // Async wrapper owns both
     dynamic_object_rejection =
         std::make_shared<glim::AsyncDynamicObjectRejection>(dyn_rejection, wall_filter, cluster_extractor);
+    // Static frames go to the odometry as soon as the rejection thread has them, not at the next scan.
+    dynamic_object_rejection->set_output_callback([this](const glim::PreprocessedFrame::Ptr& filtered) {
+      odometry_estimation->insert_frame(filtered);
+      if (filtered && !filtered->points.empty()) {
+        std_msgs::msg::Header header;
+        header.frame_id = rejection_frame_id_;
+        header.stamp = rclcpp::Time(static_cast<int64_t>((filtered->stamp - points_time_offset) * 1e9));  // stamp of the input cloud
+        static_points_pub->publish(glim_ros_utils::create_pointcloud2_msg(header, filtered));
+      }
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -397,6 +407,9 @@ GlimROS::~GlimROS() {
 
   extension_modules.clear();
 
+  // The rejection thread uses the odometry and the publishers: stop it before they are destroyed.
+  if (dynamic_object_rejection) dynamic_object_rejection->join();
+
   if (dump_on_unload) {
     wait(true);
     save("/tmp/dump");
@@ -543,17 +556,10 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   // Pipeline: WallFilter → DynamicObjectRejectionCPU (both run on async thread)
   // ---------------------------------------------------------------------------
   } else if (dynamic_rejection_type == "VOXEL") {
-    // Enqueue frame — WallFilter + rejection run on the background thread
+    // Enqueue frame — WallFilter + rejection run on the background thread, which hands the
+    // static frame to the odometry itself (output callback set in the constructor).
+    if (rejection_frame_id_.empty()) rejection_frame_id_ = msg->header.frame_id;
     dynamic_object_rejection->insert_frame(preprocessed);
-
-    // Drain static frames and feed to odometry
-    for (const auto& filtered : dynamic_object_rejection->get_results()) {
-      odometry_estimation->insert_frame(filtered);
-      if (filtered && !filtered->points.empty()) {
-        auto static_msg = glim_ros_utils::create_pointcloud2_msg(msg->header, filtered);
-        static_points_pub->publish(std::move(static_msg));
-      }
-    }
 
     // Publish latest voxelmap for visualization
     auto voxelmap = dynamic_object_rejection->get_last_voxelmap();
@@ -1305,6 +1311,11 @@ bool GlimROS::needs_wait() {
 // =============================================================================
 
 void GlimROS::wait(bool auto_quit) {
+  if (dynamic_object_rejection) {
+    // Its thread feeds the odometry: flush the remaining frames first.
+    spdlog::info("waiting for dynamic object rejection");
+    dynamic_object_rejection->join();
+  }
   spdlog::info("waiting for odometry estimation");
   odometry_estimation->join();
 
