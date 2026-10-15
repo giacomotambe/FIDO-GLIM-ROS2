@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <sstream>
 #include <thread>
 #include <iostream>
@@ -110,6 +111,28 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
   dynamic_rejection_type = config_ros.param<std::string>("glim_ros", "dynamic_rejection_type", "NONE");
   lidar_frame_id_ = config_ros.param<std::string>("glim_ros", "lidar_frame_id", "velodyne");
+
+  // Optional GT pose override (diagnostic) — see declaration in glim_ros.hpp.
+  const std::string gt_pose_file = config_ros.param<std::string>("glim_ros", "gt_pose_override_file", "");
+  if (!gt_pose_file.empty()) {
+    std::ifstream ifs(gt_pose_file);
+    if (!ifs) {
+      spdlog::error("gt_pose_override_file '{}' could not be opened — GT override disabled", gt_pose_file);
+    } else {
+      std::string line;
+      while (std::getline(ifs, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        double t, x, y, z, qx, qy, qz, qw;
+        if (!(iss >> t >> x >> y >> z >> qx >> qy >> qz >> qw)) continue;
+        Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+        T.translation() = Eigen::Vector3d(x, y, z);
+        T.linear()      = Eigen::Quaterniond(qw, qx, qy, qz).normalized().toRotationMatrix();
+        gt_poses_.emplace_back(t, T);
+      }
+      spdlog::info("gt_pose_override_file: loaded {} poses from '{}' — dynamic rejection will use GT ego-motion instead of odometry_estimation", gt_poses_.size(), gt_pose_file);
+    }
+  }
 
   tf_buffer_   = std::make_shared<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -1178,6 +1201,30 @@ void GlimROS::bbox_callback(
 }
 
 // =============================================================================
+// find_gt_pose()  —  nearest-timestamp lookup into gt_poses_ (sorted by t)
+// =============================================================================
+
+bool GlimROS::find_gt_pose(double stamp, Eigen::Isometry3d& out) const {
+  if (gt_poses_.empty()) return false;
+  auto it = std::lower_bound(
+      gt_poses_.begin(), gt_poses_.end(), stamp,
+      [](const std::pair<double, Eigen::Isometry3d>& a, double t) { return a.first < t; });
+  if (it == gt_poses_.end()) {
+    out = gt_poses_.back().second;
+    return std::abs(gt_poses_.back().first - stamp) <= 0.05;
+  }
+  if (it == gt_poses_.begin()) {
+    out = it->second;
+    return std::abs(it->first - stamp) <= 0.05;
+  }
+  const auto prev = std::prev(it);
+  const bool closer_to_prev = (stamp - prev->first) <= (it->first - stamp);
+  const auto& best = closer_to_prev ? *prev : *it;
+  out = best.second;
+  return std::abs(best.first - stamp) <= 0.05;
+}
+
+// =============================================================================
 // timer_callback()
 // =============================================================================
 
@@ -1203,8 +1250,10 @@ void GlimROS::timer_callback() {
     
     const auto& latest = estimation_frames.back();
     if (latest) {
+      Eigen::Isometry3d gt_pose;
+      const bool use_gt = !gt_poses_.empty() && find_gt_pose(latest->stamp, gt_pose);
       const Eigen::Isometry3d T_filtered =
-          pose_kalman_filter->update(latest->T_world_imu);
+          pose_kalman_filter->update(use_gt ? gt_pose : latest->T_world_imu, latest->stamp);
 
       auto pose_msg          = std::make_unique<geometry_msgs::msg::PoseStamped>();
       pose_msg->header.stamp    = rclcpp::Time(static_cast<int64_t>(latest->stamp * 1e9));

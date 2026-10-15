@@ -161,6 +161,19 @@ private:
   std::deque<KfImuData>   kf_imu_queue_;
 
   // ---------------------------------------------------------------------------
+  // Optional ground-truth pose override (diagnostic tool): when
+  // "gt_pose_override_file" is set, timer_callback() feeds the nearest-timestamp
+  // GT pose (TUM: t x y z qx qy qz qw, any rigid-body-fixed frame — only
+  // consecutive-frame deltas matter downstream) into pose_kalman_filter->update()
+  // instead of the odometry module's own T_world_imu estimate. Isolates whether
+  // dynamic-rejection precision is limited by ego-motion noise vs. the rejection
+  // algorithm itself. Does not touch odometry_estimation's own output (published
+  // odom topics still reflect the real estimator).
+  // ---------------------------------------------------------------------------
+  std::vector<std::pair<double, Eigen::Isometry3d>> gt_poses_;
+  bool find_gt_pose(double stamp, Eigen::Isometry3d& out) const;
+
+  // ---------------------------------------------------------------------------
   // Config / flags
   // ---------------------------------------------------------------------------
   bool        keep_raw_points;
